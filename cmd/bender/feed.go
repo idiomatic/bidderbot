@@ -19,13 +19,12 @@ type Message struct {
 	TakerProfileId string `json:"taker_profile_id"`
 }
 
-func Subscribe(secret, key, passphrase, productId string) (chan Message, error) {
-	ch := make(chan Message)
+func Subscribe(secret, key, passphrase, productId string) (chan Message, chan bool, error) {
+	ch := make(chan Message, 10)
+	cx := make(chan bool, 1)
 
 	go func() {
 		for ; ; time.Sleep(time.Second) {
-			log.Println(YellowBackground(Bold("connecting")))
-
 			var wsDialer ws.Dialer
 			wsConn, _, err := wsDialer.Dial("wss://ws-feed.gdax.com", nil)
 			if err != nil {
@@ -54,6 +53,17 @@ func Subscribe(secret, key, passphrase, productId string) (chan Message, error) 
 				continue
 			}
 
+			// flush the channel
+			select {
+			case <-cx:
+			default:
+			}
+
+			select {
+			case cx <- true:
+			default:
+			}
+
 			for {
 				message := Message{}
 				if err := wsConn.ReadJSON(&message); err != nil {
@@ -62,10 +72,21 @@ func Subscribe(secret, key, passphrase, productId string) (chan Message, error) 
 				}
 				ch <- message
 			}
+
+			// flush the channel
+			select {
+			case <-cx:
+			default:
+			}
+
+			select {
+			case cx <- false:
+			default:
+			}
 		}
 	}()
 
-	return ch, nil
+	return ch, cx, nil
 }
 
 func GenerateSig(message, secret string) (string, error) {

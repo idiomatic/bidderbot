@@ -20,6 +20,6 @@ func Ceil(value float64, places int) float64 {
 	return math.Ceil(value*shift) / shift
 }
 
-func Inflation(age time.Duration) float64 {
+func Inflation(age time.Duration, rate float64) float64 {
 	return math.Pow(1+rate, age.Hours()/24)
 }
