@@ -41,7 +41,7 @@ var (
 	// XXX []argv
 	envProductId = ifBlank(os.Getenv("BENDER_PRODUCT_ID"), "ETH-USD")
 
-	envRate         = ifBlank(os.Getenv("BENDER_RATE"), "1.00")
+	envRate         = ifBlank(os.Getenv("BENDER_RATE"), "0.01")
 	envBidCost      = ifBlank(os.Getenv("BENDER_BID_COST"), "1.00")
 	envBidIncrement = ifBlank(os.Getenv("BENDER_BID_INCREMENT"), "0.00")
 	envBidMax       = ifBlank(os.Getenv("BENDER_BID_MAX"), "1.00")
