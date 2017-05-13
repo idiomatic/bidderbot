@@ -70,7 +70,6 @@ func init() {
 	if envDebug != "" {
 		debug = true
 	}
-	iteratorExchangeThrottle = exchangeThrottle
 }
 
 type Price float64
