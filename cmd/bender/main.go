@@ -1,168 +1,145 @@
 package main
 
+// BidderBot places buy "bids" and sell "asks" according to some
+// simple rules:
+//
+// * not within the spread between the highest bid and lowest ask
+// * such that the ask will net a minimum of profit
+// * applying compound "profit" exponential growth curve
+//
+// This version refactors buy and sell and reduces code size by 25%.
+
 import (
+	"errors"
 	"fmt"
 	redigo "github.com/garyburd/redigo/redis"
 	gdax "github.com/preichenberger/go-coinbase-exchange"
 	"log"
 	"math"
 	"os"
+	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// ⨯ multiply
-// → yields/becomes
-// ≈ approx equal
-// ∨ maximum
-// ∧ minimum
-// Δ difference
-
-// string bender:bid:productId id
-// set/zset bender:flips:productId bidPrice|size|bidFee|bidTime askPrice
-// set/zset bender:asks:productId id askPrice
-
 const (
-	bidMoreInterval   = time.Minute
-	bidAdjustInterval = time.Minute / 10
-	askAdjustInterval = time.Minute / 10
+	productId = "ETH-USD"
+	rate      = 0.01
 )
 
 var (
-	envDebug = os.Getenv("BENDER_DEBUG")
-
 	secret     = os.Getenv("COINBASE_SECRET")
 	key        = os.Getenv("COINBASE_KEY")
 	passphrase = os.Getenv("COINBASE_PASSPHRASE")
 
-	// XXX []argv
-	envProductId = ifBlank(os.Getenv("BENDER_PRODUCT_ID"), "ETH-USD")
-
-	envRate         = ifBlank(os.Getenv("BENDER_RATE"), "1.00")
-	envBidCost      = ifBlank(os.Getenv("BENDER_BID_COST"), "1.00")
-	envBidIncrement = ifBlank(os.Getenv("BENDER_BID_INCREMENT"), "0.00")
-	envBidMax       = ifBlank(os.Getenv("BENDER_BID_MAX"), "1.00")
-	envMinProfit    = ifBlank(os.Getenv("BENDER_MIN_PROFIT"), "0.05")
-
 	exchange         *gdax.Client
 	exchangeThrottle = time.Tick(time.Second / 2)
+	exchangeTime     gdax.Time
 
-	// XXX Products map[string]Product
-	product Product
-
-	// XXX per trader account
-	fiatBroke = false
-
-	debug = false
+	buyPerMinute = 1.00
+	minProfit    = 0.01
 )
 
-func ifBlank(value, fallback string) string {
-	if value == "" {
-		value = fallback
+type Market struct {
+	Bid, Ask               float64
+	BidChanged, AskChanged chan float64
+}
+
+func NewMarket(productId string) *Market {
+	<-exchangeThrottle
+	ticker, err := exchange.GetTicker(productId)
+	if err != nil {
+		log.Panic(err)
 	}
-	return value
-}
 
-func init() {
-	if envDebug != "" {
-		debug = true
+	return &Market{
+		Bid:        ticker.Bid,
+		Ask:        ticker.Ask,
+		BidChanged: make(chan float64, 1),
+		AskChanged: make(chan float64, 1),
 	}
-	iteratorExchangeThrottle = exchangeThrottle
 }
 
-type Price float64
-type Size float64
-type Cost float64
-
-func (p Price) String() string { return fmt.Sprintf(product.PriceFormat, p) }
-func (s Size) String() string  { return fmt.Sprintf(product.SizeFormat, s) }
-func (c Cost) String() string  { return fmt.Sprintf(product.FiatFormat, c) }
-
-func PxS(price Price, size Size) Cost {
-	return Cost(float64(price) * float64(size))
+func sendFloat(value float64, ch chan float64) {
+	// non-blocking
+	select {
+	case ch <- value:
+	default:
+	}
 }
 
-type ByPrice []Price
-
-func (a ByPrice) Len() int           { return len(a) }
-func (a ByPrice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByPrice) Less(i, j int) bool { return a[i] < a[j] }
-
-type Feed struct{}
-
-type Product struct {
-	Id             string
-	FiatFormat     string
-	PriceFormat    string
-	SizeFormat     string
-	Rate           float64
-	Bid            Bid // XXX []Bid for re-up CancelOrder() optimization?
-	BidMutex       sync.Mutex
-	InitialBidCost Cost
-	BidIncrement   Cost
-	BidMax         Cost
-	MinProfit      Cost // XXX should move application from Flips to Asks
-	PricePlaces    int
-	SizePlaces     int
-	CostPlaces     int
-	MinPrice       Price
-	MinSize        Size
-	BidCost        Cost // volatile
-	MarketBid      Price
-	MarketAsk      Price
-	MarketMutex    sync.Mutex
-	Flips          []Flip
-	FlipsMutex     sync.Mutex
-	Asks           map[string]Ask
-	AsksMutex      sync.Mutex
-	MarketBidMoved chan Price
-	MarketAskMoved chan Price
-	AsksInvalidate chan bool
+func (market *Market) SetBid(bid float64) {
+	if market.Bid != bid {
+		market.Bid = bid
+		sendFloat(bid, market.BidChanged)
+	}
 }
 
-func (product *Product) RoundPrice(p Price) Price {
-	return Price(Round(float64(p), product.PricePlaces))
+func (market *Market) SetAsk(ask float64) {
+	if market.Ask != ask {
+		market.Ask = ask
+		sendFloat(ask, market.AskChanged)
+	}
 }
 
-func (product *Product) CeilPrice(p Price) Price {
-	return Price(Ceil(float64(p), product.PricePlaces))
+type Order struct {
+	Price, Size float64
 }
 
-func (product *Product) RoundSize(s Size) Size {
-	return Size(Round(float64(s), product.SizePlaces))
+type Fill struct {
+	Price, Size float64
+	Time        gdax.Time
+	objective   float64
 }
 
-func (product *Product) FloorSize(s Size) Size {
-	return Size(Floor(float64(s), product.SizePlaces))
+func Objective(price float64, dt time.Duration, rate, resolution float64) float64 {
+	return math.Ceil(price*math.Pow(1+rate, dt.Hours()/24)/resolution) * resolution
 }
 
-func (product *Product) CeilCost(c Cost) Cost {
-	return Cost(Ceil(float64(c), product.CostPlaces))
+func (fill *Fill) Objective(product *Product) float64 {
+	var dt = exchangeTime.Time().Sub(fill.Time.Time())
+	return Objective(fill.Price, dt, product.Rate, product.QuoteIncrement)
 }
 
-func (product *Product) BidStateKey() string {
-	bid := Bid{ProductId: product.Id}
-	return bid.StateKey()
+func DecodeFill(s string) (*Fill, error) {
+	var (
+		price, size float64
+		t           string
+	)
+	_, err := fmt.Sscanf(s, "%f|%f|%s", &price, &size, &t)
+	if err != nil {
+		return nil, err
+	}
+	buyTime, err := time.Parse(time.RFC3339, t)
+	if err != nil {
+		return nil, err
+	}
+	return &Fill{price, size, gdax.Time(buyTime), 0}, nil
 }
 
-func (product *Product) AskCollectionKey() string {
-	ask := Ask{ProductId: product.Id}
-	return ask.CollectionKey()
+func (fill *Fill) Encode() string {
+	var t = fill.Time.Time().Format(time.RFC3339)
+	return fmt.Sprintf("%.2f|%.8f|%s", fill.Price, fill.Size, t)
 }
 
-func (product *Product) FlipCollectionKey() string {
-	flip := Flip{ProductId: product.Id}
-	return flip.CollectionKey()
+type Buys struct {
+	Product *Product
+	Fills   []Fill
+	Mutex   sync.Mutex
 }
 
-func (product *Product) LoadBid() error {
+func (buys *Buys) StateKey() string {
+	return "bender7:buys:" + buys.Product.Id
+}
+
+// Restore buys from Redis
+func (buys *Buys) Restore() error {
 	state := redisPool.Get()
 	defer state.Close()
 
-	bidId, err := redigo.String(state.Do("GET", product.BidStateKey()))
+	buysData, err := redigo.Strings(state.Do("SMEMBERS", buys.StateKey()))
 	if err != nil {
 		if err == redigo.ErrNil {
 			return nil
@@ -170,1113 +147,556 @@ func (product *Product) LoadBid() error {
 		return err
 	}
 
-	if bidId == "" {
-		return nil
-	}
-
-	<-exchangeThrottle
-	order, err := exchange.GetOrder(bidId)
-	if err != nil {
-		if err.Error() == "NotFound" {
-			return nil
-		} else {
-			return err
-		}
-	}
-
-	product.BidMutex.Lock()
-	defer product.BidMutex.Unlock()
-
-	product.Bid = Bid(order)
-
-	return nil
-}
-
-func (product *Product) LoadFlips() error {
-	state := redisPool.Get()
-	defer state.Close()
-
-	collectionKey := product.FlipCollectionKey()
-
-	flipsData, err := redigo.Strings(state.Do("ZRANGE", collectionKey, 0, -1))
-	if err != nil {
-		return err
-	}
-
-	product.FlipsMutex.Lock()
-	defer product.FlipsMutex.Unlock()
-
-	for _, flipData := range flipsData {
-		flip, err := DecodeFlip(flipData, *product)
+	for _, data := range buysData {
+		fill, err := DecodeFill(data)
 		if err != nil {
 			return err
 		}
-		product.Flips = append(product.Flips, flip)
-		/*
-			if debug {
-				log.Println(Dim("flip load     %s", flip.Encode()))
-			}
-		*/
+		buys.Fills = append(buys.Fills, *fill)
 	}
 
 	return nil
 }
 
-func (product *Product) CancelAsks() error {
+func (buys *Buys) NextAsk(atLeast float64) Order {
+	buys.Mutex.Lock()
+	defer buys.Mutex.Unlock()
+
+	sort.Sort(ByObjective(buys))
+
+	var (
+		price     = atLeast
+		size      = 0.0
+		basisCost = minProfit
+		qi        = buys.Product.QuoteIncrement
+		iqi       = Round(1 / qi)
+		isi       = Round(1 / buys.Product.SizeIncrement)
+	)
+
+	// sum buys below or equal atLeast (market bid), otherwise below
+	// or equal to lowest price above atLeast.
+	for _, buy := range buys.Fills {
+		if buy.objective > price {
+			if size > 0.0 {
+				break
+			}
+			price = buy.objective
+		}
+		basisCost += Round(buy.Price*buy.Size*iqi) / iqi
+		size += buy.Size
+	}
+
+	if size == 0.0 {
+		return Order{0.0, 0.0}
+	}
+
+	price = math.Max(price, basisCost/size)
+	size = Round(size*isi) / isi
+	price = math.Ceil(price*iqi) / iqi
+
+	return Order{price, size}
+}
+
+func (buys *Buys) Bought(fill Fill) {
+	buys.Mutex.Lock()
+
+	// aggregate to an existing equivalent price/time buy
+	for i := range buys.Fills {
+		var f = &buys.Fills[i]
+		if fill.Price == f.Price && fill.Time == f.Time {
+			f.Size += fill.Size
+			// break and skip "else"
+			goto added
+		}
+	}
+	// else
+	buys.Fills = append(buys.Fills, fill)
+
+added:
+	buys.Mutex.Unlock()
+
 	state := redisPool.Get()
 	defer state.Close()
 
-	collectionKey := product.AskCollectionKey()
-	askIds, err := redigo.Strings(state.Do("ZRANGE", collectionKey, 0, -1))
+	_, err := state.Do("SADD", buys.StateKey(), fill.Encode())
 	if err != nil {
-		return err
+		log.Panic("buy store error: ", err)
 	}
 
-	// add in those that are missing from redis but are in memory
-	// XXX unnecessary?
-	product.AsksMutex.Lock()
-	for _, ask := range product.Asks {
-		askIds = append(askIds, ask.Id)
+	buys.Product.Log("42", "bought", fill.Price, fill.Size)
+}
+
+func (buys *Buys) Sold(fill Fill) float64 {
+	buys.Mutex.Lock()
+
+	var (
+		Log          = buys.Product.Log
+		remainder    = fill.Size
+		removeBefore = len(buys.Fills)
+		partial      *Fill
+		srem         = []interface{}{buys.StateKey()}
+	)
+
+	sort.Sort(ByObjective(buys))
+
+	for i, buy := range buys.Fills {
+		if remainder <= 0.0 {
+			break
+		}
+
+		srem = append(srem, buy.Encode())
+
+		if buy.Size < remainder {
+			buy.Size -= remainder
+			removeBefore = i
+			partial = &buy
+			Log("41", "partially sold", buy.Price, remainder)
+			break
+		}
+
+		Log("41", "sold", buy.Price, buy.Size)
+		remainder -= buy.Size
 	}
-	product.Asks = make(map[string]Ask)
-	product.AsksMutex.Unlock()
 
-	for _, askId := range askIds {
+	buys.Fills = buys.Fills[removeBefore:]
 
-	retry:
-		<-exchangeThrottle
-		err := exchange.CancelOrder(askId)
+	Log("41", "total", fill.Price, fill.Size)
+	buys.Mutex.Unlock()
+
+	state := redisPool.Get()
+	defer state.Close()
+
+	if len(srem) > 1 {
+		_, err := state.Do("SREM", srem...)
 		if err != nil {
-			if err.Error() == "request timestamp expired" {
-				log.Println(Red(Bold("ask cancel    retry")))
-				goto retry
-			} else if err.Error() == "Order already done" ||
-				err.Error() == "order not found" ||
-				err.Error() == "NotFound" {
-			} else {
-				return err
-			}
+			log.Panic("buy remove error: ", err)
 		}
-
-		_, _ = state.Do("ZREM", collectionKey, askId)
 	}
 
-	return nil
+	if partial != nil {
+		_, err := state.Do("SADD", buys.StateKey())
+		if err != nil {
+			log.Panic("buy update error: ", err)
+		}
+	}
+
+	return remainder
 }
 
-type Bid gdax.Order
+type byObjective Buys
 
-func (bid *Bid) StateKey() string {
-	return "bender:bid:" + bid.ProductId
+func (buys byObjective) Len() int           { return len(buys.Fills) }
+func (buys byObjective) Swap(i, j int)      { buys.Fills[i], buys.Fills[j] = buys.Fills[j], buys.Fills[i] }
+func (buys byObjective) Less(i, j int) bool { return buys.Fills[i].objective < buys.Fills[j].objective }
+
+func ByObjective(buys *Buys) byObjective {
+	for i := range buys.Fills {
+		buys.Fills[i].objective = buys.Fills[i].Objective(buys.Product)
+	}
+	return byObjective(*buys)
 }
 
-func (bid Bid) Save() error {
-	state := redisPool.Get()
-	defer state.Close()
-
-	_, err := state.Do("SET", bid.StateKey(), bid.Id)
-	if err != nil {
-		return err
-	}
-
-	return nil
+type Product struct {
+	gdax.Product
+	Rate               float64
+	Symbol, FiatSymbol string
+	SizeIncrement      float64
 }
 
-type Ask gdax.Order
+var logPadding = strings.Repeat(" ", 80)
 
-func (ask *Ask) CollectionKey() string {
-	return "bender:asks:" + ask.ProductId
+func (product *Product) Log(style, subject string, price, size float64, costArg ...float64) {
+	var cost = price * size
+	if len(costArg) > 0 {
+		cost = costArg[0]
+	}
+
+	ifZero := func(v float64, s1, s2 string) string {
+		if v == 0.0 {
+			return s1
+		}
+		return s2
+	}
+
+	// overcomplicated because len(string) measures vt100 escape sequences
+	log.Printf("[%sm %-24s %s %1s %s %1s %s [0m\n",
+		style,
+		subject,
+		ifZero(price, logPadding[:10],
+			fmt.Sprintf("%s[2m%s[0;%sm%.2f[2m/%s[0;%sm",
+				logPadding[len(fmt.Sprintf("%.2f", price)):10],
+				product.FiatSymbol, style, price, product.Symbol, style)),
+		ifZero(price*size, "", "⨯"),
+		ifZero(size, logPadding[:10],
+			fmt.Sprintf("%10.6f[2m%s[0;%sm", size, product.Symbol, style)),
+		ifZero(price*size, "", "≈"),
+		ifZero(cost, logPadding[:10],
+			fmt.Sprintf("%s[2m%s[0;%sm%.2f",
+				logPadding[len(fmt.Sprintf("%.2f", cost)):10],
+				product.FiatSymbol, style, cost)))
 }
 
-func (ask *Ask) Save() error {
-	state := redisPool.Get()
-	defer state.Close()
-
-	_, err := state.Do("ZADD", ask.CollectionKey(), float64(ask.Price), ask.Id)
-	if err != nil {
-		return err
-	}
-
-	return nil
+type OrderWrangler struct {
+	Product     *Product
+	Side        string
+	Price, Size float64 // XXX embed an Order (not *Order)?
+	Id          string
+	Style       string
+	Substyle    string
+	Replace     chan Order
+	Filled      chan Fill
+	Mutex       sync.Mutex
 }
 
-func (ask *Ask) Delete() error {
-	state := redisPool.Get()
-	defer state.Close()
-
-	_, err := state.Do("ZREM", ask.CollectionKey(), ask.Id)
-	if err != nil {
-		return err
+func (product *Product) OrderWrangler(side string) *OrderWrangler {
+	var style string
+	switch side {
+	case "buy":
+		style = "32"
+	case "sell":
+		style = "31"
 	}
 
-	return nil
-}
-
-type Flip struct {
-	ProductId string    `json:"product_id"`
-	Size      Size      `json:"size"`
-	BidPrice  Price     `json:"bid_price"`
-	BidFee    Cost      `json:"bid_fee"`
-	BidTime   gdax.Time `json:"bid_time"`
-	AskPrice  Price     `json:"ask_price"`
-}
-
-func (flip *Flip) Encode() string {
-	bidTime := flip.BidTime.Time().Format(time.RFC3339)
-	return fmt.Sprintf("%.2f|%.4f|%.2f|%s",
-		flip.BidPrice, flip.Size, flip.BidFee, bidTime)
-}
-
-func DecodeFlip(data string, product Product) (Flip, error) {
-	s := strings.SplitN(data, "|", 4)
-	price, err := strconv.ParseFloat(strings.TrimSpace(s[0]), 64)
-	if err != nil {
-		return Flip{}, err
+	wrangler := &OrderWrangler{
+		Product:  product,
+		Side:     side,
+		Style:    style,
+		Substyle: style + ";2",
+		Replace:  make(chan Order, 3),
+		Filled:   make(chan Fill, 3),
 	}
 
-	size, err := strconv.ParseFloat(strings.TrimSpace(s[1]), 64)
-	if err != nil {
-		return Flip{}, err
-	}
-
-	fee, err := strconv.ParseFloat(strings.TrimSpace(s[2]), 64)
-	if err != nil {
-		return Flip{}, err
-	}
-
-	bidTime, err := time.Parse(time.RFC3339, strings.TrimSpace(s[3]))
-	if err != nil {
-		return Flip{}, err
-	}
-
-	return Flip{
-		ProductId: product.Id,
-		Size:      Size(size),
-		BidPrice:  Price(price),
-		BidFee:    Cost(fee),
-		BidTime:   gdax.Time(bidTime),
-	}, nil
-}
-
-func (flip *Flip) CollectionKey() string {
-	return "bender:flips:" + flip.ProductId
-}
-
-func (flip *Flip) Save() error {
-	state := redisPool.Get()
-	defer state.Close()
-
-	_, err := state.Do("ZADD", flip.CollectionKey(),
-		float64(product.RoundPrice(flip.AskPrice)), flip.Encode())
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (flip *Flip) Delete() error {
-	state := redisPool.Get()
-	defer state.Close()
-
-	_, err := state.Do("ZREM", flip.CollectionKey(), flip.Encode())
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-type ByFlipAskPrice []Flip
-
-func (a ByFlipAskPrice) Len() int           { return len(a) }
-func (a ByFlipAskPrice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByFlipAskPrice) Less(i, j int) bool { return a[i].AskPrice < a[j].AskPrice }
-
-type ByAsksPrice []Ask
-
-func (a ByAsksPrice) Len() int           { return len(a) }
-func (a ByAsksPrice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByAsksPrice) Less(i, j int) bool { return a[i].Price < a[j].Price }
-
-func (flip *Flip) InflatingAskPrice(when gdax.Time) Price {
-	// GDAX rounds costs up
-	minBase := product.CeilCost(PxS(flip.BidPrice, flip.Size)) + flip.BidFee
-	minProfit := minBase + product.MinProfit
-
-	dt := when.Time().Sub(flip.BidTime.Time())
-	inflated := product.CeilCost(Cost(float64(minBase) * Inflation(dt, product.Rate)))
-
-	higherCost := minProfit
-	if higherCost < inflated {
-		higherCost = inflated
-	}
-
-	product.MarketMutex.Lock()
-	defer product.MarketMutex.Unlock()
-
-	higherPrice := product.CeilPrice(Price(float64(higherCost) / float64(flip.Size)))
-
-	if higherPrice < product.MarketAsk {
-		higherPrice = product.MarketAsk
-	}
-
-	if debug {
-		log.Println(Dim("market        %10s               ⨯  %10s               ≈  %7s",
-			product.MarketAsk, flip.Size, PxS(product.MarketAsk, flip.Size)))
-
-		log.Println(Dim("min profit    %10s + %10s  →  %10s               ≈  %7s",
-			minBase, product.MinProfit,
-			product.CeilPrice(Price(float64(minProfit)/float64(flip.Size))), minProfit))
-
-		log.Println(Dim("inflated      %10s * %10.6f  →  %10s               ≈  %7s",
-			minBase, Inflation(dt, product.Rate),
-			product.CeilPrice(Price(float64(inflated)/float64(flip.Size))), inflated))
-	}
-
-	return higherPrice
-}
-
-func (product *Product) Desires() map[Price]Size {
-	var desires = make(map[Price]Size)
-
-	product.FlipsMutex.Lock()
-	for _, flip := range product.Flips {
-		desires[flip.AskPrice] += flip.Size
-	}
-	product.FlipsMutex.Unlock()
-
-	for price, size := range desires {
-		desires[price] = product.RoundSize(size)
-	}
-
-	return desires
-}
-
-func (product *Product) Asking() map[Price]Size {
-	var asking = make(map[Price]Size)
-
-	product.AsksMutex.Lock()
-	for _, ask := range product.Asks {
-		asking[Price(ask.Price)] += Size(ask.Size)
-	}
-	product.AsksMutex.Unlock()
-
-	for price, size := range asking {
-		asking[price] = product.RoundSize(size)
-	}
-
-	return asking
-}
-
-func (product *Product) BidMore() {
 	go func() {
-		if product.BidIncrement <= 0 {
-			log.Println(YellowBackground("warning: bid increment                                                          %7s", Cost(product.BidIncrement)))
-			return
-		}
-
-		for range time.Tick(bidMoreInterval) {
-			product.BidMutex.Lock()
-			product.BidCost += product.BidIncrement
-			if product.BidCost > product.BidMax {
-				product.BidCost = product.BidMax
-			}
-			product.BidMutex.Unlock()
-		}
-	}()
-}
-
-func (product *Product) AdjustBid() {
-	go func() {
-		if product.BidCost <= 0 {
-			log.Println(YellowBackground("warning: bid cost                                                               %7s", Cost(0)))
-			return
-		}
-
-		for {
-			if fiatBroke {
-				time.Sleep(bidAdjustInterval)
-			} else {
-				select {
-				case <-product.MarketBidMoved:
-				case <-time.After(bidAdjustInterval):
-				}
-			}
-
-			product.MarketMutex.Lock()
-			price := product.MarketBid
-			product.MarketMutex.Unlock()
-
-			// XXX Floor or Round?
-			size := product.FloorSize(
-				Size(float64(product.BidCost) / float64(price)))
-
-			product.BidMutex.Lock()
+		for order := range wrangler.Replace {
 			var (
-				bidPrice = Price(product.Bid.Price)
-				bidSize  = Size(product.Bid.Size)
-				bidId    = product.Bid.Id
+				qi    = product.QuoteIncrement
+				iqi   = Round(1 / qi)
+				isi   = Round(1 / product.SizeIncrement)
+				bms   = product.BaseMinSize
+				price = Round(order.Price*iqi) / iqi
+				size  = Round(order.Size*isi) / isi
 			)
-			product.BidMutex.Unlock()
 
-			if price == Price(bidPrice) && size == Size(bidSize) {
+			wrangler.Mutex.Lock()
+			unchanged := wrangler.Id != "" &&
+				price == wrangler.Price &&
+				size == wrangler.Size
+			wrangler.Mutex.Unlock()
+
+			if unchanged {
 				continue
 			}
 
-			var msg string
-
-			if bidId != "" {
-				// XXX monitor external order cancels?
-				msg = Green("bid adjust    %10s → %10s  ⨯  %10s → %10s  ≈  %7s → %7s",
-					bidPrice, price, bidSize, size,
-					PxS(bidPrice, bidSize), PxS(price, size))
-
-			cancel_retry:
-				<-exchangeThrottle
-				err := exchange.CancelOrder(bidId)
-				if err != nil {
-					if err.Error() == "request timestamp expired" {
-						// try again later
-						log.Println(Green(Bold("bid cancel    retry")))
-						goto cancel_retry
-					} else if err.Error() == "Order already done" ||
-						err.Error() == "order not found" ||
-						err.Error() == "NotFound" {
-					} else {
-						log.Panic(err)
-					}
-				}
-
-				product.BidMutex.Lock()
-				if product.Bid.Id == bidId {
-					product.Bid.Id = ""
-				}
-				product.BidMutex.Unlock()
-			} else {
-				msg = Green("bid new                    %10s  ⨯               %10s  ≈            %7s",
-					price, size, PxS(price, size))
-			}
-
-			if price < product.MinPrice || size < product.MinSize {
-				continue
-			}
-
-			bid, err := CreateBid(price, size)
-			if err != nil {
-				if err.Error() == "Insufficient funds" {
-					if !fiatBroke {
-						log.Println(Green(Bold("bid no cash                %10s  ⨯               %10s  ≈            %7s",
-							price, size, PxS(price, size))))
-
-						// reset to minimum bidding (BidMore() may bump it up)
-						product.BidCost = product.InitialBidCost
-						fiatBroke = true
-					}
-					continue
-				} else {
-					log.Println(msg)
-					log.Panic(err)
-				}
-			}
-
-			if bid.Status != "open" && bid.Status != "pending" {
-				log.Println(Green(Bold("bid %-16s       %10s  ⨯               %10s  ≈            %7s",
-					bid.Status, price, size, PxS(price, size))))
-				continue
-			}
-
-			fiatBroke = false
-
-			product.BidMutex.Lock()
-			product.Bid = bid
-			product.BidMutex.Unlock()
-
-			// chatty
-			log.Println(msg)
-
-			err = product.Bid.Save()
+			err := wrangler.Cancel()
 			if err != nil {
 				log.Panic(err)
 			}
-		}
-	}()
-}
 
-func (product *Product) AdjustAskExpectations() {
-	go func() {
-		if product.MinProfit <= 0 {
-			log.Println(YellowBackground("warning: min profit                                                             %7s", product.MinProfit))
-		}
-		if product.Rate <= 0 {
-			log.Println(YellowBackground("warning: rate                                                                   %7s", product.Rate))
-		}
+			// too small to matter
+			if price < qi || size < bms {
+				//wrangler.Product.Log(wrangler.Substyle, wrangler.Side + " too small", price, size)
+				continue
+			}
 
-		// HACK to get it out of step with bidAdjust
-		time.Sleep(time.Second)
-
-		for range time.Tick(askAdjustInterval) {
-
+		create_order:
 			<-exchangeThrottle
-			now, err := GetServerTime()
-			if err != nil {
+			confirm, err := exchange.CreateOrder(&gdax.Order{
+				Type:      "limit",
+				Side:      side,
+				ProductId: product.Id,
+				Price:     price,
+				Size:      size,
+				PostOnly:  true,
+			})
+			if IsExpiredRequest(err) {
+				// retry
+				wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" create retry", 0, 0)
+				goto create_order
+			} else if IsBroke(err) {
+				wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
+				continue
+			} else if err != nil && !IsNotFound(err) && !IsDone(err) {
+				wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
 				log.Panic(err)
 			}
 
-			product.FlipsMutex.Lock()
-			for i := range product.Flips {
-				flip := &product.Flips[i]
-				price := flip.InflatingAskPrice(now)
-				if price != flip.AskPrice {
-					if debug {
-						log.Println(Dim("inflating     %10s → %10s  ⨯               %10s  ≈  %7s → %7s",
-							flip.AskPrice, price, flip.Size,
-							PxS(flip.AskPrice, flip.Size),
-							PxS(price, flip.Size)))
-					}
-					flip.AskPrice = price
-					select {
-					case product.AsksInvalidate <- true:
-					default:
-					}
+			wrangler.Mutex.Lock()
+			wrangler.Id = confirm.Id
+			wrangler.Price = confirm.Price
+			wrangler.Size = confirm.Size
+			wrangler.Mutex.Unlock()
 
-					err := flip.Save()
-					if err != nil {
-						log.Panic(err)
-					}
-				}
-			}
-			sort.Sort(ByFlipAskPrice(product.Flips))
-			product.FlipsMutex.Unlock()
+			wrangler.Product.Log(wrangler.Style, wrangler.Side, confirm.Price, confirm.Size)
 		}
 	}()
+
+	return wrangler
 }
 
-func (product *Product) AdjustAsks() {
-	go func() {
-		for {
-			select {
-			case <-product.MarketAskMoved:
-			case <-product.AsksInvalidate:
-			}
+func (wrangler *OrderWrangler) Cancel() error {
+	wrangler.Mutex.Lock()
+	var (
+		id    = wrangler.Id
+		price = wrangler.Price
+		size  = wrangler.Size
+	)
+	wrangler.Id = ""
+	wrangler.Mutex.Unlock()
 
-			var (
-				openSize    = product.Asking()
-				desiredSize = product.Desires()
-			)
+	if id != "" {
 
-			if len(product.Flips) == 0 {
-				continue
-			}
-
-			/*
-				deadline := time.Now().Add(askAdjustInterval)
-			*/
-
-			/*
-				if debug {
-					var eitherPrices []Price
-					var eitherPricesSeen = make(map[Price]bool)
-					for price := range desiredSize {
-						eitherPrices = append(eitherPrices, price)
-						eitherPricesSeen[price] = true
-					}
-					for price := range openSize {
-						if !eitherPricesSeen[price] {
-							eitherPrices = append(eitherPrices, price)
-						}
-					}
-					sort.Sort(ByPrice(eitherPrices))
-					for _, price := range eitherPrices {
-						log.Println(Dim("ask demand                 %10s  ⨯  %10s + %10s  ≈            %7s",
-							price, openSize[price], desiredSize[price]-openSize[price],
-							PxS(price, desiredSize[price])))
-					}
-				}
-			*/
-
-			// remove over-ask at a particlar price
-			var cancellingAsks []Ask
-			product.AsksMutex.Lock()
-			for _, ask := range product.Asks {
-				price := Price(ask.Price)
-				size := Size(ask.Size)
-				if openSize[price] > desiredSize[price] {
-					/*
-						if debug {
-							log.Println(Red(Dim("cancelling    %10s               ⨯  %10s → %10s  ≈  %7s",
-								price, desiredSize[price], openSize[price],
-								PxS(price, size))))
-						}
-					*/
-					cancellingAsks = append(cancellingAsks, ask)
-					openSize[price] -= size
-				}
-			}
-			product.AsksMutex.Unlock()
-
-			// XXX lazily cancel as coin is needed
-			sort.Sort(ByAsksPrice(cancellingAsks))
-
-			for _, ask := range cancellingAsks {
-				price := Price(ask.Price)
-				size := Size(ask.Size)
-				log.Println(Red("ask cancel    %10s               ⨯  %10s               ≈  %7s",
-					price, size, PxS(price, size)))
-
-				// copy for concurrency
-				askId := ask.Id
-
-				if askId != "" {
-
-				retry:
-					<-exchangeThrottle
-					err := exchange.CancelOrder(askId)
-					if err != nil {
-						if err.Error() == "request timestamp expired" {
-							// try again later
-							log.Println(Red(Bold("ask cancel    retry")))
-							goto retry
-						} else if err.Error() == "Order already done" ||
-							err.Error() == "order not found" ||
-							err.Error() == "NotFound" {
-							continue
-						} else {
-							log.Panic(err)
-						}
-					}
-
-					err = ask.Delete()
-					if err != nil {
-						log.Panic(err)
-					}
-				}
-			}
-
-			product.AsksMutex.Lock()
-			for _, ask := range cancellingAsks {
-				delete(product.Asks, ask.Id)
-			}
-			product.AsksMutex.Unlock()
-
-			// HACK to allow time to settle; can omit if suitable coin balance exists
-			time.Sleep(time.Millisecond * 200)
-
-			var desiredPrices []Price
-			for price, _ := range desiredSize {
-				desiredPrices = append(desiredPrices, price)
-			}
-			sort.Sort(ByPrice(desiredPrices))
-			for _, price := range desiredPrices {
-				size := desiredSize[price] - openSize[price]
-				size = Size(Round(float64(size), product.SizePlaces))
-				if size <= 0 {
-					continue
-				}
-
-				var msg string
-
-				if price < product.MinPrice || size < product.MinSize {
-					msg = Red(Dim("ask later                  %10s  ⨯  %10s               ≈            %7s",
-						price, size, PxS(price, size)))
-					continue
-				}
-
-				if openSize[price] > 0 {
-					msg = Red("ask more                   %10s  ⨯  %10s → %10s  ≈            %7s",
-						price, openSize[price], desiredSize[price],
-						PxS(price, size))
-				} else {
-					msg = Red("ask                        %10s  ⨯               %10s  ≈            %7s",
-						price, size, PxS(price, size))
-				}
-
-				ask, err := CreateAsk(price, size)
-				if err != nil {
-					if err.Error() == "Insufficient funds" {
-						if debug {
-							_ = LogBalance()
-						}
-						log.Println(Red(Bold("ask no coin                %10s  ⨯               %10s  ≈            %7s",
-							price, size, PxS(price, size))))
-						// try again later
-						continue
-					}
-					log.Println(msg)
-					log.Panic(err)
-				}
-
-				// XXX wish defer worked in scopes, not functions
-				log.Println(msg)
-
-				err = ask.Save()
-				if err != nil {
-					log.Panic(err)
-				}
-
-				product.AsksMutex.Lock()
-				product.Asks[ask.Id] = ask
-				product.AsksMutex.Unlock()
-
-				openSize[price] += Size(ask.Size)
-
-				/*
-					// only get a few seconds before restarting the loop
-					if time.Now().After(deadline) {
-						break
-					}
-				*/
-			}
-
-			// XXX ask more when all flips have an incumbent ask?
+	cancel_order:
+		<-exchangeThrottle
+		err := exchange.CancelOrder(id)
+		if IsExpiredRequest(err) {
+			// retry
+			wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" cancel retry", 0, 0)
+			goto cancel_order
+		} else if err != nil && !IsNotFound(err) && !IsDone(err) {
+			return err
 		}
-	}()
-}
 
-func (product *Product) MonitorMarket(feed *Feed) {
-	log.Println(YellowBackground("MonitorMarket NYI"))
-}
-
-func (product *Product) MonitorTransactions(feed *Feed) {
-	log.Println(YellowBackground("MonitorTransactions NYI"))
-}
-
-func GetServerTime() (gdax.Time, error) {
-	serverTime, err := exchange.GetTime()
-	if err != nil {
-		return gdax.Time{}, err
+		wrangler.Product.Log(wrangler.Style, wrangler.Side+" cancel", price, size)
 	}
-	now, err := time.Parse(time.RFC3339, serverTime.ISO)
-	if err != nil {
-		return gdax.Time{}, err
-	}
-	serverNow := gdax.Time(now)
 
-	return serverNow, nil
-}
-
-func LogBalance() error {
-	<-exchangeThrottle
-	accounts, err := exchange.GetAccounts()
-	if err != nil {
-		return err
-	}
-	for _, account := range accounts {
-		log.Println(Dim("balance %-3s %12.6f %12.6f %12.6f",
-			account.Currency, account.Balance, account.Hold, account.Available))
-	}
 	return nil
 }
 
-func CreateBid(price Price, size Size) (Bid, error) {
-	bid := gdax.Order{
-		Type:      "limit",
-		Side:      "buy",
-		ProductId: product.Id,
-		Price:     float64(price),
-		Size:      float64(size),
-		PostOnly:  true,
+func (wrangler *OrderWrangler) Fill(message gdax.Message) {
+	wrangler.Mutex.Lock()
+	defer wrangler.Mutex.Unlock()
+
+	Log := wrangler.Product.Log
+
+	if message.MakerOrderId == wrangler.Id {
+		// may be partial
+		wrangler.Size -= message.Size
+		if wrangler.Size <= 0.0 {
+			wrangler.Size = 0.0
+			wrangler.Id = ""
+			Log(wrangler.Style, wrangler.Side+" fill", message.Price, message.Size)
+		} else {
+			Log(wrangler.Style, wrangler.Side+" partial fill", message.Price, message.Size)
+			Log(wrangler.Substyle, wrangler.Side+" remainder", wrangler.Price, wrangler.Size)
+		}
+		// XXX non-zero objective?
+		wrangler.Filled <- Fill{message.Price, message.Size, message.Time, 0}
+	}
+}
+
+func main() {
+	exchange = gdax.NewClient(secret, key, passphrase)
+
+	<-exchangeThrottle
+	feed := NewFeed(secret, key, passphrase)
+
+	var (
+		p, _    = GetProduct(productId)
+		product = &Product{
+			Product:       *p,
+			Symbol:        "Ξ",
+			FiatSymbol:    "$",
+			SizeIncrement: 1 / 1e4,
+		}
+		buys   = Buys{Product: product}
+		market = NewMarket(productId)
+		bidder = product.OrderWrangler("buy")
+		asker  = product.OrderWrangler("sell")
+	)
+
+	product.Log("32;2", "market bid", market.Bid, 0)
+	product.Log("31;2", "market ask", market.Ask, 0)
+
+	err := buys.Restore()
+	if err != nil {
+		log.Panic(err)
 	}
 
-retry:
-	<-exchangeThrottle
-	confirm, err := exchange.CreateOrder(&bid)
+	messages := make(chan gdax.Message, 10)
+	err = feed.Subscribe(productId, messages)
 	if err != nil {
-		if err.Error() == "request timestamp expired" {
-			log.Println(Red(Bold("bid create    retry")))
-			goto retry
+		log.Panic(err)
+	}
+
+	bidder.Replace <- Order{market.Bid, buyPerMinute / market.Bid}
+	asker.Replace <- buys.NextAsk(market.Ask)
+
+	// periodically invest more
+	go func() {
+		for range time.Tick(time.Minute) {
+			bidder.Mutex.Lock()
+			var (
+				marketBid = market.Bid
+				basis     = bidder.Price * bidder.Size
+			)
+			bidder.Mutex.Unlock()
+
+			bidder.Replace <- Order{marketBid, (basis + buyPerMinute) / marketBid}
+		}
+	}()
+
+	// adjust bid when the market goes up
+	go func() {
+		for bid := range market.BidChanged {
+			bidder.Mutex.Lock()
+			var basis = bidder.Price * bidder.Size
+			bidder.Mutex.Unlock()
+
+			product.Log("32;2", "market bid", bid, 0)
+			bidder.Replace <- Order{bid, basis / bid}
+		}
+	}()
+
+	// reprice if gap is shrinking and it's still profitable
+	go func() {
+		for ask := range market.AskChanged {
+			product.Log("31;2", "market ask", ask, 0)
+			asker.Replace <- buys.NextAsk(market.Ask)
+		}
+	}()
+
+	// record bid-fill and maybe lower the ask order
+	go func() {
+		for buy := range bidder.Filled {
+			buys.Bought(buy)
+
+			/*
+				objective := buy.Objective(product)
+				if objective < asker.Price || asker.Id == "" {
+					// sell this buy prior to incumbent ask,
+					// or no ask order is (likely) placed
+					asker.Replace <- Order{objective, buy.Size}
+				} else if objective == asker.Price {
+					// add this buy to existing placed ask
+					product.Log("2", "more reorder", objective, asker.Size+buy.Size)
+					asker.Replace <- Order{objective, asker.Size + buy.Size}
+				}
+			*/
+			asker.Replace <- buys.NextAsk(market.Ask)
+		}
+	}()
+
+	// remove completed investments and place next higher priced one
+	go func() {
+		for sell := range asker.Filled {
+			remainder := buys.Sold(sell)
+			if remainder > 0.0 {
+				log.Println("warning: unattributed ask fill", remainder)
+			} else {
+				asker.Replace <- buys.NextAsk(market.Ask)
+			}
+		}
+	}()
+
+	// catch ^C
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	go func() {
+		<-interrupt
+		signal.Stop(interrupt)
+		println()
+		log.Println("[43m cancelling [m")
+		buyPerMinute = 0.0
+		bidder.Cancel()
+		asker.Cancel()
+		close(messages)
+		os.Exit(1)
+	}()
+
+	go func() {
+		for up := range feed.Connection {
+			if up {
+				log.Println("[43m connected [m")
+			} else {
+				log.Println("[43m disconnected [m")
+			}
+		}
+	}()
+
+	// dispatch messages from the websocket
+	for message := range messages {
+		var price = message.Price
+
+		switch message.Type {
+
+		case "received":
+			if message.OrderType == "limit" {
+				switch message.Side {
+				case "buy":
+					// only if shrinking the gap
+					// XXX should differentiate between limit and match to ignore limit probes
+					if market.Ask > price && price > market.Bid {
+						market.SetBid(price)
+					}
+				case "sell":
+					if market.Ask > price && price > market.Bid {
+						market.SetAsk(price)
+					}
+				}
+			}
+
+		case "match":
+			switch message.Side {
+			case "buy":
+				bidder.Fill(message)
+				market.SetBid(price)
+			case "sell":
+				asker.Fill(message)
+				market.SetAsk(price)
+			}
+
 		}
 	}
-	return Bid(confirm), err
 }
 
-func CreateAsk(price Price, size Size) (Ask, error) {
-	ask := gdax.Order{
-		Type:      "limit",
-		Side:      "sell",
-		ProductId: product.Id,
-		Price:     float64(price),
-		Size:      float64(size),
-		PostOnly:  true,
-	}
+// gdax.go
 
-retry:
+func IsNotFound(err error) bool {
+	return err != nil && (err.Error() == "order not found" ||
+		err.Error() == "NotFound")
+}
+
+func IsDone(err error) bool {
+	return err != nil && err.Error() == "Order already done"
+}
+
+func IsBroke(err error) bool {
+	return err != nil && err.Error() == "Insufficient funds"
+}
+
+func IsExpiredRequest(err error) bool {
+	// go-coinbase-exchange should tap GetTime() or WebSocket messages for server time
+	return err != nil && err.Error() == "request timestamp expired"
+}
+
+func GetTime() (gdax.Time, error) {
 	<-exchangeThrottle
-	confirm, err := exchange.CreateOrder(&ask)
-	if err != nil && err.Error() == "request timestamp expired" {
-		log.Println(Red(Bold("ask create    retry")))
-		goto retry
+	exchangeNow, err := exchange.GetTime()
+	if err != nil {
+		return gdax.Time{}, err
 	}
-	return Ask(confirm), err
+	now, err := time.Parse(time.RFC3339, exchangeNow.ISO)
+	if err != nil {
+		return gdax.Time{}, err
+	}
+	return gdax.Time(now), nil
 }
 
-func LoadProduct(productId string) (Product, error) {
-	var productConstants = map[string]Product{
-		"BTC-USD": Product{
-			FiatFormat:  "$%.2f",
-			PriceFormat: "$%.2f/฿",
-			SizeFormat:  "฿%.6f",
-		},
-		"ETH-USD": Product{
-			FiatFormat:  "$%.2f",
-			PriceFormat: "%.2f$/Ξ",
-			SizeFormat:  "%.6fΞ",
-		},
-		"LTC-USD": Product{
-			FiatFormat:  "$%.2f",
-			PriceFormat: "$%.2f/Ł",
-			SizeFormat:  "%.6fŁ",
-		},
-	}
-
+func GetProduct(productId string) (*gdax.Product, error) {
 	<-exchangeThrottle
 	products, err := exchange.GetProducts()
 	if err != nil {
-		return product, err
+		return nil, err
 	}
 
 	for _, p := range products {
 		if p.Id == productId {
-
-			rate, err := strconv.ParseFloat(envRate, 64)
-			if err != nil {
-				return Product{}, err
-			}
-			bidCost, err := strconv.ParseFloat(envBidCost, 64)
-			if err != nil {
-				return Product{}, err
-			}
-			bidIncrement, err := strconv.ParseFloat(envBidIncrement, 64)
-			if err != nil {
-				return Product{}, err
-			}
-			bidMax, err := strconv.ParseFloat(envBidMax, 64)
-			if err != nil {
-				return Product{}, err
-			}
-			minProfit, err := strconv.ParseFloat(envMinProfit, 64)
-			if err != nil {
-				return Product{}, err
-			}
-
-			product = Product{
-				Id:             productId,
-				FiatFormat:     productConstants[productId].FiatFormat,
-				PriceFormat:    productConstants[productId].PriceFormat,
-				SizeFormat:     productConstants[productId].SizeFormat,
-				PricePlaces:    int(-math.Log10(p.QuoteIncrement)),
-				SizePlaces:     6,
-				CostPlaces:     2,
-				MinPrice:       Price(p.QuoteIncrement),
-				MinSize:        Size(p.BaseMinSize),
-				Rate:           rate,
-				InitialBidCost: Cost(bidCost),
-				BidIncrement:   Cost(bidIncrement),
-				BidMax:         Cost(bidMax),
-				MinProfit:      Cost(minProfit), // be advised, GDAX truncates USD pennies
-				Asks:           make(map[string]Ask),
-				MarketAskMoved: make(chan Price, 1),
-				MarketBidMoved: make(chan Price, 1),
-				AsksInvalidate: make(chan bool, 1),
-			}
-			product.BidCost = product.InitialBidCost
+			return &p, nil
 		}
 	}
-
-	<-exchangeThrottle
-	ticker, err := exchange.GetTicker(product.Id)
-	if err != nil {
-		return product, err
-	}
-
-	product.MarketMutex.Lock()
-	product.MarketBid = Price(ticker.Bid)
-	product.MarketAsk = Price(ticker.Ask)
-	product.MarketMutex.Unlock()
-
-	return product, nil
+	return nil, errors.New("product not found")
 }
 
-func init() {
-	log.SetFlags(log.Ldate | log.Ltime | log.LUTC)
-}
-
-func main() {
-	var err error
-
-	exchange = gdax.NewClient(secret, key, passphrase)
-
-	{
-		p, err := LoadProduct(envProductId)
-		if err != nil {
-			log.Panic(err)
-		}
-		product = p
-	}
-	product.MarketMutex.Lock()
-	log.Println(Dim("market       [%10s , %10s]",
-		product.MarketBid, product.MarketAsk))
-	product.MarketMutex.Unlock()
-
-	// recover open bid
-	err = product.LoadBid()
-	if err != nil {
-		log.Panic(err)
-	}
-
-	// recover flips
-	err = product.LoadFlips()
-	if err != nil {
-		log.Panic(err)
-	}
-
-	// remove flips via fills while i was sleeping
-	log.Println(YellowBackground(Bold("flip purge NYI")))
-
-	err = product.CancelAsks()
-	if err != nil {
-		log.Panic(err)
-	}
-
-	product.BidMore()
-	product.AdjustBid()
-	product.AdjustAskExpectations()
-	product.AdjustAsks()
-
-	feed := NewRealTimeFeed(&product)
-
-	product.MonitorMarket(feed)
-	product.MonitorTransactions(feed)
-
-}
-
-func NewRealTimeFeed(product *Product) *Feed {
-	messages, connected, err := Subscribe(secret, key, passphrase, product.Id)
-	if err != nil {
-		log.Panic(err)
-	}
-
-	go func() {
-		for up := range connected {
-			if up {
-				log.Println(YellowBackground(Bold("connected")))
-			} else {
-				log.Println(YellowBackground(Bold("disconnected")))
-			}
-		}
-	}()
-
-	for message := range messages {
-		// XXX Round() unnecessary?
-		price := Price(Round(message.Price, product.PricePlaces))
-		size := Size(Round(message.Size, product.SizePlaces))
-
-		switch message.Type {
-		case "received":
-			// track market prices
-			switch message.OrderType {
-			case "limit":
-				product.MarketMutex.Lock()
-				switch message.Side {
-				case "buy":
-					if price < product.MarketAsk {
-						if debug {
-							// HACK crazy limits
-							if Price(message.Price) > product.MarketBid {
-								log.Println(Dim("market       [%10s , %10s]",
-									product.MarketBid, product.MarketAsk))
-							}
-						}
-						product.MarketBid = Price(Round(
-							math.Max(
-								float64(product.MarketBid),
-								message.Price),
-							product.PricePlaces))
-
-						select {
-						case product.MarketBidMoved <- product.MarketBid:
-						default:
-						}
-					}
-				case "sell":
-					if price > product.MarketBid {
-						if debug {
-							if Price(message.Price) < product.MarketAsk {
-								log.Println(Dim("market       [%10s , %10s]",
-									product.MarketBid, product.MarketAsk))
-							}
-						}
-						product.MarketAsk = Price(Round(
-							math.Min(
-								float64(product.MarketAsk),
-								message.Price),
-							product.PricePlaces))
-
-						select {
-						case product.MarketAskMoved <- product.MarketAsk:
-						default:
-						}
-					}
-				}
-				product.MarketMutex.Unlock()
-			}
-
-		case "match":
-			// track market prices
-			switch message.Side {
-			case "buy":
-				product.MarketMutex.Lock()
-				product.MarketBid = price
-
-				select {
-				case product.MarketBidMoved <- product.MarketBid:
-				default:
-				}
-
-				product.MarketMutex.Unlock()
-
-			case "sell":
-				product.MarketMutex.Lock()
-				product.MarketAsk = price
-
-				select {
-				case product.MarketAskMoved <- product.MarketAsk:
-				default:
-				}
-
-				product.MarketMutex.Unlock()
-			}
-
-			switch message.Side {
-			case "buy":
-				product.BidMutex.Lock()
-				bidId := product.Bid.Id
-				product.BidMutex.Unlock()
-
-				if bidId != "" && message.MakerOrderId == bidId {
-					// XXX chan to separate concerns?
-					flip := Flip{
-						ProductId: product.Id,
-						Size:      size,
-						BidPrice:  price,
-						BidFee:    0.0, // XXX
-						BidTime:   message.Time,
-					}
-					flip.AskPrice = flip.InflatingAskPrice(message.Time)
-					// XXX does GDAX Ceil?
-					basis := PxS(price, size)
-					askCost := PxS(flip.AskPrice, flip.Size)
-					log.Println(GreenBackground(White("flip          %10s → %10s  ⨯               %10s  ≈            %7s Δ %7s",
-						price, flip.AskPrice, size, basis, askCost-basis)))
-
-					product.FlipsMutex.Lock()
-					product.Flips = append(product.Flips, flip)
-					product.FlipsMutex.Unlock()
-
-					err := flip.Save()
-					if err != nil {
-						log.Panic(err)
-					}
-
-					// XXX partial bid satisfaction?
-					product.BidCost = product.InitialBidCost
-
-					product.BidMutex.Lock()
-					if product.Bid.Id == bidId {
-						product.Bid.Id = ""
-					}
-					product.BidMutex.Unlock()
-
-					select {
-					case product.AsksInvalidate <- true:
-					default:
-					}
-				}
-			case "sell":
-				// XXX what about combined asks that are responsible for multiple flips?
-
-				costSold := PxS(price, size)
-				var costBasis Cost
-
-				// are we watching this ask?
-				product.AsksMutex.Lock()
-				_, ok := product.Asks[message.MakerOrderId]
-				product.AsksMutex.Unlock()
-				if !ok {
-					continue
-				}
-
-				// remove some flip(s) and/or some portion of a flip
-				var (
-					deleteFlips []Flip
-					newFlips    []Flip
-				)
-				product.FlipsMutex.Lock()
-				remainder := size
-				if debug {
-					log.Println(Dim("flip remainder                              %10s, %d flips",
-						remainder, len(product.Flips)))
-				}
-				for i := range product.Flips {
-					flip := &product.Flips[i]
-					if flip.AskPrice != price {
-						if debug {
-							log.Println(Dim("flip retain   %10s → %10s  ⨯               %10s  ≈            %7s",
-								flip.BidPrice, flip.AskPrice, flip.Size,
-								PxS(flip.AskPrice, flip.Size)))
-						}
-						newFlips = append(newFlips, *flip)
-						continue
-					}
-
-					var contribution Size
-					if flip.Size > Size(Round(float64(remainder), product.SizePlaces)) {
-						contribution = remainder
-						log.Println(Dim("flip split    %10s → %10s  ⨯  %10s → %10s  ≈            %7s",
-							flip.BidPrice, flip.AskPrice, flip.Size, remainder,
-							PxS(flip.AskPrice, flip.Size)))
-						newFlips = append(newFlips, *flip)
-						// XXX shrunkFlips to .Save()
-					} else {
-						contribution = flip.Size
-						deleteFlips = append(deleteFlips, *flip)
-						log.Println(Dim("flip sold     %10s → %10s  ⨯               %10s  ≈            %7s",
-							flip.BidPrice, flip.AskPrice, flip.Size, PxS(flip.AskPrice, flip.Size)))
-					}
-
-					if contribution > 0 {
-						flip.Size -= contribution
-						remainder -= contribution
-						costBasis += PxS(flip.BidPrice, contribution) + flip.BidFee
-					}
-				}
-				product.Flips = newFlips
-				product.FlipsMutex.Unlock()
-
-				if remainder > 0 {
-					log.Println(Dim("flip remainder %8s, %d flips",
-						remainder, len(newFlips)))
-				}
-
-				for _, flip := range deleteFlips {
-					err := flip.Delete()
-					if err != nil {
-						log.Fatal(err)
-					}
-				}
-
-				product.AsksMutex.Lock()
-				delete(product.Asks, message.MakerOrderId)
-				product.AsksMutex.Unlock()
-
-				if costBasis > 0 {
-					profit := costSold - costBasis
-					log.Println(RedBackground(White("ask sold      %10s               ⨯  %10s               ≈  %7s → %7s Δ %7s",
-						price, size, costBasis, costSold, profit)))
-				}
-			}
-		}
-	}
-
-	return &Feed{}
+func Round(v float64) float64 {
+	return math.Trunc(v + 0.5)
 }

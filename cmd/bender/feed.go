@@ -4,92 +4,141 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	ws "github.com/gorilla/websocket"
+	"github.com/gorilla/websocket"
 	gdax "github.com/preichenberger/go-coinbase-exchange"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 )
 
-type Message struct {
-	gdax.Message
-	UserId         string `json:"user_id"`
-	TakerUserId    string `json:"taker_user_id"`
-	ProfileId      string `json:"profile_id"`
-	TakerProfileId string `json:"taker_profile_id"`
+var (
+	ExchangeTime gdax.Time
+	FeedBackoff  = time.Second
+)
+
+type Feed struct {
+	Connection              chan bool
+	conn                    *websocket.Conn
+	mutex                   sync.Mutex
+	subscriptions           map[string]chan gdax.Message
+	secret, key, passphrase string
 }
 
-func Subscribe(secret, key, passphrase, productId string) (chan Message, chan bool, error) {
-	ch := make(chan Message, 10)
-	cx := make(chan bool, 1)
+func NewFeed(secret, key, passphrase string) *Feed {
+	feed := &Feed{
+		Connection:    make(chan bool, 1),
+		subscriptions: make(map[string]chan gdax.Message),
+		secret:        secret,
+		key:           key,
+		passphrase:    passphrase,
+	}
 
 	go func() {
-		for ; ; time.Sleep(time.Second) {
-			var wsDialer ws.Dialer
-			wsConn, _, err := wsDialer.Dial("wss://ws-feed.gdax.com", nil)
+		for ; ; time.Sleep(FeedBackoff) {
+			var dialer websocket.Dialer
+			conn, _, err := dialer.Dial("wss://ws-feed.gdax.com", nil)
 			if err != nil {
 				log.Println(err)
 				continue
 			}
+			feed.conn = conn
 
-			timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+			feed.mutex.Lock()
+			for productId := range feed.subscriptions {
+				_ = feed.SendSubscribe(productId)
+			}
+			feed.mutex.Unlock()
 
-			signature, err := GenerateSig(timestamp+"GET/users/self", secret)
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			subscribe := map[string]string{
-				"type":       "subscribe",
-				"product_id": productId,
-				"key":        key,
-				"passphrase": passphrase,
-				"timestamp":  timestamp,
-				"signature":  signature,
-			}
-			if err := wsConn.WriteJSON(subscribe); err != nil {
-				log.Println(err)
-				continue
-			}
-
-			// flush the channel
-			select {
-			case <-cx:
-			default:
-			}
-
-			select {
-			case cx <- true:
-			default:
-			}
+			feed.SetConnected(true)
 
 			for {
-				message := Message{}
-				if err := wsConn.ReadJSON(&message); err != nil {
+				message := gdax.Message{}
+				if err := feed.conn.ReadJSON(&message); err != nil {
 					log.Print(err)
 					break
 				}
-				ch <- message
+
+				if message.Time.Time().After(ExchangeTime.Time()) {
+					ExchangeTime = message.Time
+				}
+
+				feed.mutex.Lock()
+				ch, ok := feed.subscriptions[message.ProductId]
+				feed.mutex.Unlock()
+
+				if ok {
+					ch <- message
+					// XXX if channel closed, unsubscribe
+				}
 			}
 
-			// flush the channel
-			select {
-			case <-cx:
-			default:
-			}
+			feed.SetConnected(false)
 
-			select {
-			case cx <- false:
-			default:
-			}
 		}
 	}()
 
-	return ch, cx, nil
+	return feed
 }
 
-func GenerateSig(message, secret string) (string, error) {
+func (feed *Feed) SetConnected(mode bool) {
+	// flush the channel
+	select {
+	case <-feed.Connection:
+	default:
+	}
+
+	// non-blockingly send
+	select {
+	case feed.Connection <- mode:
+	default:
+	}
+}
+
+func (feed *Feed) Close() {
+	// XXX close()?
+	feed.conn.Close()
+}
+
+func (feed *Feed) Subscribe(productId string, ch chan gdax.Message) error {
+	feed.mutex.Lock()
+	defer feed.mutex.Unlock()
+
+	feed.subscriptions[productId] = ch
+
+	if feed.conn != nil {
+		if err := feed.SendSubscribe(productId); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (feed *Feed) SendSubscribe(productId string) error {
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+
+	signature, err := GenerateSignature(timestamp+"GET/users/self", feed.secret)
+	if err != nil {
+		return err
+	}
+
+	subscribe := map[string]string{
+		"type":       "subscribe",
+		"product_id": productId,
+		"key":        feed.key,
+		"passphrase": feed.passphrase,
+		"timestamp":  timestamp,
+		"signature":  signature,
+	}
+	if err := feed.conn.WriteJSON(subscribe); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func GenerateSignature(message, secret string) (string, error) {
 	key, err := base64.StdEncoding.DecodeString(secret)
 	if err != nil {
 		return "", err
