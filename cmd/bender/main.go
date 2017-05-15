@@ -460,7 +460,6 @@ func (wrangler *OrderWrangler) Cancel() error {
 		price = wrangler.Price
 		size  = wrangler.Size
 	)
-	//wrangler.Id = ""
 	wrangler.Size = 0.0 // for zeroing outstanding basis computations
 	wrangler.Mutex.Unlock()
 
@@ -498,7 +497,6 @@ func (wrangler *OrderWrangler) Fill(message gdax.Message) {
 		// may be partial
 		wrangler.Size -= message.Size
 		if wrangler.Size <= 0.0 {
-			//wrangler.Id = ""
 			wrangler.Size = 0.0
 			Log(wrangler.Style, wrangler.Side+" fill", message.Price, message.Size)
 		} else {
@@ -560,10 +558,6 @@ func main() {
 				marketBid = market.Bid
 				basis     = bidder.Price * bidder.Size
 			)
-			// XXX
-			if basis > 0.0 && bidder.Id == "" {
-				log.Println("basis but no bid, peroidic")
-			}
 			bidder.Mutex.Unlock()
 
 			bidder.Replace <- Order{marketBid, (basis + buyPerMinute) / marketBid}
@@ -577,10 +571,6 @@ func main() {
 			var basis = bidder.Price * bidder.Size
 			if bidder.Id != "" {
 				product.Log("32;2", "market bid", bid, 0)
-			}
-			// XXX
-			if basis > 0.0 && bidder.Id == "" {
-				log.Println("basis but no bid")
 			}
 			bidder.Mutex.Unlock()
 
