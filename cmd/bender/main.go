@@ -10,16 +10,12 @@ package main
 // This version refactors buy and sell and reduces code size by 25%.
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	redigo "github.com/garyburd/redigo/redis"
 	gdax "github.com/preichenberger/go-coinbase-exchange"
-	"io/ioutil"
 	"log"
 	"math"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -467,7 +463,8 @@ func (wrangler *OrderWrangler) Cancel() error {
 
 	cancel_order:
 		<-exchangeThrottle
-		err := exchange.CancelOrder(id)
+		//err := exchange.CancelOrder(id)
+		err := CancelOrder(exchange, id)
 
 		if IsExpiredRequest(err) {
 			// retry
@@ -569,12 +566,11 @@ func main() {
 		for bid := range market.BidChanged {
 			bidder.Mutex.Lock()
 			var basis = bidder.Price * bidder.Size
-			if bidder.Id != "" {
+			if bidder.Size > 0.0 {
 				product.Log("32;2", "market bid", bid, 0)
+				bidder.Replace <- Order{bid, basis / bid}
 			}
 			bidder.Mutex.Unlock()
-
-			bidder.Replace <- Order{bid, basis / bid}
 		}
 	}()
 
@@ -583,12 +579,11 @@ func main() {
 	go func() {
 		for ask := range market.AskChanged {
 			asker.Mutex.Lock()
-			if asker.Id != "" {
+			if asker.Size > 0.0 {
 				product.Log("31;2", "market ask", ask, 0)
+				asker.Replace <- buys.NextAsk(market.Ask)
 			}
 			asker.Mutex.Unlock()
-
-			asker.Replace <- buys.NextAsk(market.Ask)
 		}
 	}()
 
