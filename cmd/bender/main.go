@@ -10,23 +10,23 @@ package main
 // This version refactors buy and sell and reduces code size by 25%.
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	redigo "github.com/garyburd/redigo/redis"
 	gdax "github.com/preichenberger/go-coinbase-exchange"
+	"io/ioutil"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-)
-
-const (
-	productId = "ETH-USD"
-	rate      = 0.01
 )
 
 var (
@@ -38,9 +38,25 @@ var (
 	exchangeThrottle = time.Tick(time.Second / 2)
 	exchangeTime     gdax.Time
 
-	buyPerMinute = 1.00
-	minProfit    = 0.01
+	productId       = ifBlank(os.Getenv("BENDER_PRODUCT_ID"), "ETH-USD")
+	rate, _         = strconv.ParseFloat(ifBlank(os.Getenv("BENDER_RATE"), "0.01"), 64)
+	buyPerMinute, _ = strconv.ParseFloat(ifBlank(os.Getenv("BENDER_BUY_PER_MINUTE"), "1.00"), 64)
+	minProfit, _    = strconv.ParseFloat(ifBlank(os.Getenv("BENDER_MIN_PROFIT"), "0.01"), 64)
 )
+
+func ifBlank(value, fallback string) string {
+	if value == "" {
+		value = fallback
+	}
+	return value
+}
+
+func ifZero(v float64, zero, otherwise string) string {
+	if v == 0.0 {
+		return zero
+	}
+	return otherwise
+}
 
 type Market struct {
 	Bid, Ask               float64
@@ -63,7 +79,7 @@ func NewMarket(productId string) *Market {
 }
 
 func sendFloat(value float64, ch chan float64) {
-	// non-blocking
+	// non-blocking; consumer is often in io wait
 	select {
 	case ch <- value:
 	default:
@@ -94,13 +110,15 @@ type Fill struct {
 	objective   float64
 }
 
-func Objective(price float64, dt time.Duration, rate, resolution float64) float64 {
-	return math.Ceil(price*math.Pow(1+rate, dt.Hours()/24)/resolution) * resolution
+// Objective computes the desired ask price considering safer
+// investment lost oppportunity.
+func Objective(price float64, dt time.Duration, rate float64) float64 {
+	return price * math.Pow(1+rate, dt.Hours()/24)
 }
 
 func (fill *Fill) Objective(product *Product) float64 {
 	var dt = exchangeTime.Time().Sub(fill.Time.Time())
-	return Objective(fill.Price, dt, product.Rate, product.QuoteIncrement)
+	return Objective(fill.Price, dt, product.Rate)
 }
 
 func DecodeFill(s string) (*Fill, error) {
@@ -158,6 +176,9 @@ func (buys *Buys) Restore() error {
 	return nil
 }
 
+// NextAsk picks buys ripe to sell.  NextAsk sum buys below or equal
+// atLeast (i.e., market bid), otherwise below or equal to lowest
+// price above atLeast.
 func (buys *Buys) NextAsk(atLeast float64) Order {
 	buys.Mutex.Lock()
 	defer buys.Mutex.Unlock()
@@ -165,24 +186,25 @@ func (buys *Buys) NextAsk(atLeast float64) Order {
 	sort.Sort(ByObjective(buys))
 
 	var (
-		price     = atLeast
-		size      = 0.0
-		basisCost = minProfit
-		qi        = buys.Product.QuoteIncrement
-		iqi       = Round(1 / qi)
-		isi       = Round(1 / buys.Product.SizeIncrement)
+		price = atLeast
+		size  = 0.0
+		basis = minProfit
+		qi    = buys.Product.QuoteIncrement
+		iqi   = Round(1 / qi)
+		isi   = Round(1 / buys.Product.SizeIncrement)
 	)
 
-	// sum buys below or equal atLeast (market bid), otherwise below
-	// or equal to lowest price above atLeast.
 	for _, buy := range buys.Fills {
 		if buy.objective > price {
+			// already have a suitable price above ask; do not go higher
 			if size > 0.0 {
 				break
 			}
-			price = buy.objective
+			// raise the price until we match or exceed ask
+			price = math.Ceil(buy.objective*iqi) / iqi
+
 		}
-		basisCost += Round(buy.Price*buy.Size*iqi) / iqi
+		basis += Round(buy.Price*buy.Size*iqi) / iqi
 		size += buy.Size
 	}
 
@@ -190,29 +212,17 @@ func (buys *Buys) NextAsk(atLeast float64) Order {
 		return Order{0.0, 0.0}
 	}
 
-	price = math.Max(price, basisCost/size)
+	price = math.Max(price, basis/size)
 	size = Round(size*isi) / isi
 	price = math.Ceil(price*iqi) / iqi
 
 	return Order{price, size}
 }
 
+// Bought records a (continuing partial) purchase.
 func (buys *Buys) Bought(fill Fill) {
 	buys.Mutex.Lock()
-
-	// aggregate to an existing equivalent price/time buy
-	for i := range buys.Fills {
-		var f = &buys.Fills[i]
-		if fill.Price == f.Price && fill.Time == f.Time {
-			f.Size += fill.Size
-			// break and skip "else"
-			goto added
-		}
-	}
-	// else
 	buys.Fills = append(buys.Fills, fill)
-
-added:
 	buys.Mutex.Unlock()
 
 	state := redisPool.Get()
@@ -226,41 +236,53 @@ added:
 	buys.Product.Log("42", "bought", fill.Price, fill.Size)
 }
 
+// Sold removes outstanding buy(s), possibly fractionally.
 func (buys *Buys) Sold(fill Fill) float64 {
 	buys.Mutex.Lock()
 
 	var (
-		Log          = buys.Product.Log
-		remainder    = fill.Size
-		removeBefore = len(buys.Fills)
-		partial      *Fill
-		srem         = []interface{}{buys.StateKey()}
+		Log       = buys.Product.Log
+		remainder = fill.Size
+		partial   *Fill
+		srem      = []interface{}{buys.StateKey()}
+		basis     = 0.0
 	)
 
 	sort.Sort(ByObjective(buys))
 
-	for i, buy := range buys.Fills {
+	for _, buy := range buys.Fills {
 		if remainder <= 0.0 {
 			break
 		}
 
 		srem = append(srem, buy.Encode())
 
-		if buy.Size < remainder {
-			buy.Size -= remainder
-			removeBefore = i
-			partial = &buy
+		if buy.Size > remainder {
 			Log("41", "partially sold", buy.Price, remainder)
+			basis += buy.Price * remainder
+			buy.Size -= remainder
+			remainder = 0.0
+			partial = &buy
 			break
 		}
 
 		Log("41", "sold", buy.Price, buy.Size)
+		basis += buy.Price * buy.Size
 		remainder -= buy.Size
+
+		// HACK
+		var isi = Round(1 / buys.Product.SizeIncrement)
+		remainder = Round(remainder*isi) / isi
+
+		buys.Fills = buys.Fills[1:]
 	}
 
-	buys.Fills = buys.Fills[removeBefore:]
+	if len(srem) > 2 {
+		Log("41", "total", fill.Price, fill.Size)
+	}
+	var profit = fill.Price*fill.Size - basis
+	Log("41", "profit", profit/fill.Size, fill.Size, profit)
 
-	Log("41", "total", fill.Price, fill.Size)
 	buys.Mutex.Unlock()
 
 	state := redisPool.Get()
@@ -274,7 +296,7 @@ func (buys *Buys) Sold(fill Fill) float64 {
 	}
 
 	if partial != nil {
-		_, err := state.Do("SADD", buys.StateKey())
+		_, err := state.Do("SADD", buys.StateKey(), partial.Encode())
 		if err != nil {
 			log.Panic("buy update error: ", err)
 		}
@@ -303,7 +325,7 @@ type Product struct {
 	SizeIncrement      float64
 }
 
-var logPadding = strings.Repeat(" ", 80)
+var logPadding = strings.Repeat(" ", 13)
 
 func (product *Product) Log(style, subject string, price, size float64, costArg ...float64) {
 	var cost = price * size
@@ -311,26 +333,19 @@ func (product *Product) Log(style, subject string, price, size float64, costArg 
 		cost = costArg[0]
 	}
 
-	ifZero := func(v float64, s1, s2 string) string {
-		if v == 0.0 {
-			return s1
-		}
-		return s2
-	}
-
 	// overcomplicated because len(string) measures vt100 escape sequences
 	log.Printf("[%sm %-24s %s %1s %s %1s %s [0m\n",
 		style,
 		subject,
-		ifZero(price, logPadding[:10],
+		ifZero(price, logPadding[:13],
 			fmt.Sprintf("%s[2m%s[0;%sm%.2f[2m/%s[0;%sm",
 				logPadding[len(fmt.Sprintf("%.2f", price)):10],
 				product.FiatSymbol, style, price, product.Symbol, style)),
 		ifZero(price*size, "", "⨯"),
-		ifZero(size, logPadding[:10],
+		ifZero(size, logPadding[:11],
 			fmt.Sprintf("%10.6f[2m%s[0;%sm", size, product.Symbol, style)),
 		ifZero(price*size, "", "≈"),
-		ifZero(cost, logPadding[:10],
+		ifZero(cost, logPadding[:11],
 			fmt.Sprintf("%s[2m%s[0;%sm%.2f",
 				logPadding[len(fmt.Sprintf("%.2f", cost)):10],
 				product.FiatSymbol, style, cost)))
@@ -367,6 +382,8 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 	}
 
 	go func() {
+		var Log = wrangler.Product.Log
+
 		for order := range wrangler.Replace {
 			var (
 				qi    = product.QuoteIncrement
@@ -378,9 +395,7 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 			)
 
 			wrangler.Mutex.Lock()
-			unchanged := wrangler.Id != "" &&
-				price == wrangler.Price &&
-				size == wrangler.Size
+			var unchanged = (price == wrangler.Price && size == wrangler.Size)
 			wrangler.Mutex.Unlock()
 
 			if unchanged {
@@ -394,7 +409,7 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 
 			// too small to matter
 			if price < qi || size < bms {
-				//wrangler.Product.Log(wrangler.Substyle, wrangler.Side + " too small", price, size)
+				Log(wrangler.Substyle, wrangler.Side+" too small", price, size)
 				continue
 			}
 
@@ -410,13 +425,16 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 			})
 			if IsExpiredRequest(err) {
 				// retry
-				wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" create retry", 0, 0)
+				Log(wrangler.Substyle, wrangler.Side+" create retry", 0, 0)
+				goto create_order
+			} else if IsMalformedResponse(err) {
+				Log(wrangler.Substyle, wrangler.Side+" malformed create response", 0, 0)
 				goto create_order
 			} else if IsBroke(err) {
-				wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
+				Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
 				continue
 			} else if err != nil && !IsNotFound(err) && !IsDone(err) {
-				wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
+				Log(wrangler.Substyle, wrangler.Side+" create failed", price, size)
 				log.Panic(err)
 			}
 
@@ -426,7 +444,7 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 			wrangler.Size = confirm.Size
 			wrangler.Mutex.Unlock()
 
-			wrangler.Product.Log(wrangler.Style, wrangler.Side, confirm.Price, confirm.Size)
+			Log(wrangler.Style, wrangler.Side, confirm.Price, confirm.Size)
 		}
 	}()
 
@@ -434,13 +452,16 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 }
 
 func (wrangler *OrderWrangler) Cancel() error {
+	var Log = wrangler.Product.Log
+
 	wrangler.Mutex.Lock()
 	var (
 		id    = wrangler.Id
 		price = wrangler.Price
 		size  = wrangler.Size
 	)
-	wrangler.Id = ""
+	//wrangler.Id = ""
+	wrangler.Size = 0.0 // for zeroing outstanding basis computations
 	wrangler.Mutex.Unlock()
 
 	if id != "" {
@@ -448,15 +469,20 @@ func (wrangler *OrderWrangler) Cancel() error {
 	cancel_order:
 		<-exchangeThrottle
 		err := exchange.CancelOrder(id)
+
 		if IsExpiredRequest(err) {
 			// retry
-			wrangler.Product.Log(wrangler.Substyle, wrangler.Side+" cancel retry", 0, 0)
+			Log(wrangler.Substyle, wrangler.Side+" cancel retry", 0, 0)
+			goto cancel_order
+		} else if IsMalformedResponse(err) {
+			Log(wrangler.Substyle, wrangler.Side+" malformed cancel response", 0, 0)
 			goto cancel_order
 		} else if err != nil && !IsNotFound(err) && !IsDone(err) {
+			Log(wrangler.Substyle, wrangler.Side+" cancel failed", 0, 0)
 			return err
 		}
 
-		wrangler.Product.Log(wrangler.Style, wrangler.Side+" cancel", price, size)
+		Log(wrangler.Style, wrangler.Side+" cancel", price, size)
 	}
 
 	return nil
@@ -472,8 +498,8 @@ func (wrangler *OrderWrangler) Fill(message gdax.Message) {
 		// may be partial
 		wrangler.Size -= message.Size
 		if wrangler.Size <= 0.0 {
+			//wrangler.Id = ""
 			wrangler.Size = 0.0
-			wrangler.Id = ""
 			Log(wrangler.Style, wrangler.Side+" fill", message.Price, message.Size)
 		} else {
 			Log(wrangler.Style, wrangler.Side+" partial fill", message.Price, message.Size)
@@ -485,10 +511,14 @@ func (wrangler *OrderWrangler) Fill(message gdax.Message) {
 }
 
 func main() {
+	var err error
+
 	exchange = gdax.NewClient(secret, key, passphrase)
 
+	exchangeTime, err = GetTime()
+
 	<-exchangeThrottle
-	feed := NewFeed(secret, key, passphrase)
+	var feed = NewFeed(secret, key, passphrase)
 
 	var (
 		p, _    = GetProduct(productId)
@@ -497,6 +527,7 @@ func main() {
 			Symbol:        "Ξ",
 			FiatSymbol:    "$",
 			SizeIncrement: 1 / 1e4,
+			Rate:          rate,
 		}
 		buys   = Buys{Product: product}
 		market = NewMarket(productId)
@@ -507,12 +538,12 @@ func main() {
 	product.Log("32;2", "market bid", market.Bid, 0)
 	product.Log("31;2", "market ask", market.Ask, 0)
 
-	err := buys.Restore()
+	err = buys.Restore()
 	if err != nil {
 		log.Panic(err)
 	}
 
-	messages := make(chan gdax.Message, 10)
+	var messages = make(chan gdax.Message, 10)
 	err = feed.Subscribe(productId, messages)
 	if err != nil {
 		log.Panic(err)
@@ -529,6 +560,10 @@ func main() {
 				marketBid = market.Bid
 				basis     = bidder.Price * bidder.Size
 			)
+			// XXX
+			if basis > 0.0 && bidder.Id == "" {
+				log.Println("basis but no bid, peroidic")
+			}
 			bidder.Mutex.Unlock()
 
 			bidder.Replace <- Order{marketBid, (basis + buyPerMinute) / marketBid}
@@ -540,17 +575,29 @@ func main() {
 		for bid := range market.BidChanged {
 			bidder.Mutex.Lock()
 			var basis = bidder.Price * bidder.Size
+			if bidder.Id != "" {
+				product.Log("32;2", "market bid", bid, 0)
+			}
+			// XXX
+			if basis > 0.0 && bidder.Id == "" {
+				log.Println("basis but no bid")
+			}
 			bidder.Mutex.Unlock()
 
-			product.Log("32;2", "market bid", bid, 0)
 			bidder.Replace <- Order{bid, basis / bid}
 		}
 	}()
 
 	// reprice if gap is shrinking and it's still profitable
+	// also has the side effect of occasionally inflating
 	go func() {
 		for ask := range market.AskChanged {
-			product.Log("31;2", "market ask", ask, 0)
+			asker.Mutex.Lock()
+			if asker.Id != "" {
+				product.Log("31;2", "market ask", ask, 0)
+			}
+			asker.Mutex.Unlock()
+
 			asker.Replace <- buys.NextAsk(market.Ask)
 		}
 	}()
@@ -559,19 +606,6 @@ func main() {
 	go func() {
 		for buy := range bidder.Filled {
 			buys.Bought(buy)
-
-			/*
-				objective := buy.Objective(product)
-				if objective < asker.Price || asker.Id == "" {
-					// sell this buy prior to incumbent ask,
-					// or no ask order is (likely) placed
-					asker.Replace <- Order{objective, buy.Size}
-				} else if objective == asker.Price {
-					// add this buy to existing placed ask
-					product.Log("2", "more reorder", objective, asker.Size+buy.Size)
-					asker.Replace <- Order{objective, asker.Size + buy.Size}
-				}
-			*/
 			asker.Replace <- buys.NextAsk(market.Ask)
 		}
 	}()
@@ -589,7 +623,7 @@ func main() {
 	}()
 
 	// catch ^C
-	interrupt := make(chan os.Signal, 1)
+	var interrupt = make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 	go func() {
 		<-interrupt
@@ -616,6 +650,9 @@ func main() {
 	// dispatch messages from the websocket
 	for message := range messages {
 		var price = message.Price
+		if !message.Time.Time().IsZero() {
+			exchangeTime = message.Time
+		}
 
 		switch message.Type {
 
@@ -667,6 +704,10 @@ func IsBroke(err error) bool {
 func IsExpiredRequest(err error) bool {
 	// go-coinbase-exchange should tap GetTime() or WebSocket messages for server time
 	return err != nil && err.Error() == "request timestamp expired"
+}
+
+func IsMalformedResponse(err error) bool {
+	return err != nil && err.Error() == "invalid character '<' looking for beginning of value"
 }
 
 func GetTime() (gdax.Time, error) {
