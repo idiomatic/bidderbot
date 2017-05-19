@@ -40,6 +40,13 @@ var (
 	minProfit, _    = strconv.ParseFloat(ifBlank(os.Getenv("BENDER_MIN_PROFIT"), "0.01"), 64)
 )
 
+const (
+	BUY_MORE_INTERVAL = time.Minute
+
+	BROKE_RETRIES     = 3
+	BROKE_RETRY_DELAY = time.Millisecond * 100
+)
+
 func ifBlank(value, fallback string) string {
 	if value == "" {
 		value = fallback
@@ -145,7 +152,7 @@ type Buys struct {
 }
 
 func (buys *Buys) StateKey() string {
-	return "bender7:buys:" + buys.Product.Id
+	return "bender:buys:" + buys.Product.Id
 }
 
 // Restore buys from Redis
@@ -200,6 +207,7 @@ func (buys *Buys) NextAsk(atLeast float64) Order {
 			price = math.Ceil(buy.objective*iqi) / iqi
 
 		}
+		// XXX math.Ceil?
 		basis += Round(buy.Price*buy.Size*iqi) / iqi
 		size += buy.Size
 	}
@@ -255,6 +263,7 @@ func (buys *Buys) Sold(fill Fill) float64 {
 
 		if buy.Size > remainder {
 			Log("41", "partially sold", buy.Price, remainder)
+			// XXX math.Ceil?
 			basis += buy.Price * remainder
 			buy.Size -= remainder
 			remainder = 0.0
@@ -382,12 +391,13 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 
 		for order := range wrangler.Replace {
 			var (
-				qi    = product.QuoteIncrement
-				iqi   = Round(1 / qi)
-				isi   = Round(1 / product.SizeIncrement)
-				bms   = product.BaseMinSize
-				price = Round(order.Price*iqi) / iqi
-				size  = Round(order.Size*isi) / isi
+				qi         = product.QuoteIncrement
+				iqi        = Round(1 / qi)
+				isi        = Round(1 / product.SizeIncrement)
+				bms        = product.BaseMinSize
+				price      = Round(order.Price*iqi) / iqi
+				size       = Round(order.Size*isi) / isi
+				brokeTries = 0
 			)
 
 			wrangler.Mutex.Lock()
@@ -428,6 +438,11 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 				goto create_order
 			} else if IsBroke(err) {
 				Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
+				time.Sleep(BROKE_RETRY_DELAY)
+				brokeTries++
+				if brokeTries <= BROKE_RETRIES {
+					goto create_order
+				}
 				continue
 			} else if err != nil && !IsNotFound(err) && !IsDone(err) {
 				Log(wrangler.Substyle, wrangler.Side+" create failed", price, size)
@@ -505,6 +520,10 @@ func (wrangler *OrderWrangler) Fill(message gdax.Message) {
 	}
 }
 
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC)
+}
+
 func main() {
 	var err error
 
@@ -519,7 +538,7 @@ func main() {
 		p, _    = GetProduct(productId)
 		product = &Product{
 			Product:       *p,
-			Symbol:        "Ξ",
+			Symbol:        "Ξ", // XXX lookup
 			FiatSymbol:    "$",
 			SizeIncrement: 1 / 1e4,
 			Rate:          rate,
@@ -549,7 +568,7 @@ func main() {
 
 	// periodically invest more
 	go func() {
-		for range time.Tick(time.Minute) {
+		for range time.Tick(BUY_MORE_INTERVAL) {
 			bidder.Mutex.Lock()
 			var (
 				marketBid = market.Bid
@@ -722,6 +741,8 @@ func GetProduct(productId string) (*gdax.Product, error) {
 	}
 	return nil, errors.New("product not found")
 }
+
+// math.go
 
 func Round(v float64) float64 {
 	return math.Trunc(v + 0.5)
