@@ -43,7 +43,6 @@ var (
 const (
 	BUY_MORE_INTERVAL = time.Minute
 
-	BROKE_RETRIES     = 3
 	BROKE_RETRY_DELAY = time.Millisecond * 100
 )
 
@@ -359,6 +358,7 @@ func (product *Product) Log(style, subject string, price, size float64, costArg 
 type OrderWrangler struct {
 	Product     *Product
 	Side        string
+	Retries     int
 	Price, Size float64 // XXX embed an Order (not *Order)?
 	Id          string
 	Style       string
@@ -369,17 +369,24 @@ type OrderWrangler struct {
 }
 
 func (product *Product) OrderWrangler(side string) *OrderWrangler {
-	var style string
+	var (
+		style   string
+		retries int
+	)
+
 	switch side {
 	case "buy":
 		style = "32"
+		retries = 0
 	case "sell":
 		style = "31"
+		retries = 3
 	}
 
 	wrangler := &OrderWrangler{
 		Product:  product,
 		Side:     side,
+		Retries:  retries,
 		Style:    style,
 		Substyle: style + ";2",
 		Replace:  make(chan Order, 3),
@@ -438,9 +445,9 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 				goto create_order
 			} else if IsBroke(err) {
 				Log(wrangler.Substyle, wrangler.Side+" broke", price, size)
-				time.Sleep(BROKE_RETRY_DELAY)
 				brokeTries++
-				if brokeTries <= BROKE_RETRIES {
+				if brokeTries <= wrangler.Retries {
+					time.Sleep(BROKE_RETRY_DELAY * time.Duration(brokeTries))
 					goto create_order
 				}
 				continue
