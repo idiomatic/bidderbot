@@ -151,7 +151,7 @@ type Buys struct {
 }
 
 func (buys *Buys) StateKey() string {
-	return "bender:buys:" + buys.Product.Id
+	return "bender:buys:" + buys.Product.ID
 }
 
 // Restore buys from Redis
@@ -431,7 +431,7 @@ func (product *Product) OrderWrangler(side string) *OrderWrangler {
 			confirm, err := exchange.CreateOrder(&gdax.Order{
 				Type:      "limit",
 				Side:      side,
-				ProductId: product.Id,
+				ProductID: product.ID,
 				Price:     price,
 				Size:      size,
 				PostOnly:  true,
@@ -742,7 +742,7 @@ func GetProduct(productId string) (*gdax.Product, error) {
 	}
 
 	for _, p := range products {
-		if p.Id == productId {
+		if p.ID == productId {
 			return &p, nil
 		}
 	}

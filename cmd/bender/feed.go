@@ -64,7 +64,7 @@ func NewFeed(secret, key, passphrase string) *Feed {
 				}
 
 				feed.mutex.Lock()
-				ch, ok := feed.subscriptions[message.ProductId]
+				ch, ok := feed.subscriptions[message.ProductID]
 				feed.mutex.Unlock()
 
 				if ok {
